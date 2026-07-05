@@ -1,10 +1,1 @@
-@dataclass
-class ImageRecord:
-    page_number: int
-    image_number: int
-    image_file: str
-    width: int
-    height: int
-    extension: str
-    source: str
-    bbox: Optional[List[float]] = None
+
