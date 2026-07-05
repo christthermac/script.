@@ -1,1 +1,911 @@
+Chart Extractor
+This notebook extracts and saves:
 
+Texts: native PDF text, OCR text, page-level text, full text
+Images: rendered pages, normalized pages, embedded PDF images
+Charts: chart/figure candidate crops using OpenCV
+Tables: tables from PDF pages using pdfplumber
+Metadata: JSON and Excel summary
+Supported inputs:
+
+PDF, JPG, JPEG, PNG, TIFF, SVG
+
+# Install packages if needed.
+=========================================================================================================
+# Core packages:
+# !pip install pymupdf pillow opencv-python numpy pandas openpyxl tqdm pdfplumber pytesseract
+
+# Optional for SVG rasterization:
+# !pip install cairosvg
+
+# For OCR, install Tesseract OCR on the computer.
+# Windows Tesseract installer:
+# https://github.com/UB-Mannheim/tesseract/wiki
+=================================================================================================================
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import logging
+import warnings
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import fitz  # PyMuPDF
+import cv2
+import numpy as np
+import pandas as pd
+from PIL import Image, ImageSequence
+from tqdm import tqdm
+
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
+
+SUPPORTED_INPUTS = {
+    ".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff",
+    ".svg"
+}
+
+@dataclass
+class LoadedPage:
+    page_number: int
+    source_type: str
+    original_image: str
+    normalized_image: str
+    width: int
+    height: int
+
+@dataclass
+class TextRecord:
+    page_number: int
+    native_text_file: Optional[str]
+    ocr_text_file: Optional[str]
+    native_word_count: int
+    ocr_word_count: int
+
+@dataclass
+class ImageRecord:
+    page_number: int
+    image_number: int
+    image_file: str
+    width: int
+    height: int
+    extension: str
+    source: str
+    bbox: Optional[List[float]] = None
+
+@dataclass
+class TableRecord:
+    page_number: int
+    table_number: int
+    csv_file: str
+    rows: int
+    cols: int
+    source: str
+
+@dataclass
+class ChartRecord:
+    page_number: int
+    chart_number: int
+    crop_file: str
+    bbox: List[int]
+    reason: str
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+def write_text(path: Path, text: str) -> None:
+    ensure_dir(path.parent)
+    path.write_text(text or "", encoding="utf-8", errors="replace")
+
+def write_json(path: Path, data: Any) -> None:
+    ensure_dir(path.parent)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+def clean_text(text: str) -> str:
+    text = text or ""
+    text = text.replace("\\x00", " ")
+    text = text.replace("\\uFFFD", " ")
+    text = re.sub(r"[ \\t]+", " ", text)
+    text = re.sub(r"\\n{3,}", "\\n\\n", text)
+    return text.strip()
+
+def command_exists(command: str) -> bool:
+    return shutil.which(command) is not None
+
+def has_tesseract() -> bool:
+    return pytesseract is not None and command_exists("tesseract")
+
+def pil_to_cv(image: Image.Image) -> np.ndarray:
+    return cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+def cv_to_pil(image: np.ndarray) -> Image.Image:
+    return Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+
+# Suppress harmless PDF parser warnings such as:
+# "CropBox missing from /Page, defaulting to MediaBox"
+warnings.filterwarnings("ignore", message=r".*CropBox missing.*")
+logging.getLogger("pdfminer").setLevel(logging.ERROR)
+logging.getLogger("pdfplumber").setLevel(logging.ERROR)
+================================================================================================
+
+1. Layout normalization
+This stage improves OCR and chart detection by denoising, deskewing, sharpening, contrast enhancement, and margin cleanup.
+
+============================================================================================================================
+def deskew_image_cv(img: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    inverted = cv2.bitwise_not(gray)
+    thresh = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]
+
+    coords = np.column_stack(np.where(thresh > 0))
+    if coords.size < 100:
+        return img
+
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = -(90 + angle)
+    else:
+        angle = -angle
+
+    # Avoid aggressive wrong rotation
+    if abs(angle) < 0.1 or abs(angle) > 10:
+        return img
+
+    h, w = img.shape[:2]
+    center = (w // 2, h // 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(
+        img, matrix, (w, h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE
+    )
+
+def normalize_layout(
+    input_image: Path,
+    output_image: Path,
+    denoise: bool = True,
+    deskew: bool = True,
+    contrast: bool = True,
+    sharpen: bool = True,
+    margin_cleanup: bool = True,
+    max_dim: int = 3500,
+) -> None:
+    ensure_dir(output_image.parent)
+
+    pil_img = Image.open(input_image).convert("RGB")
+    w, h = pil_img.size
+    largest = max(w, h)
+
+    # Keep images manageable for OCR but preserve detail
+    if largest > max_dim:
+        scale = max_dim / largest
+        pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+
+    img = pil_to_cv(pil_img)
+
+    if margin_cleanup:
+        img = cv2.copyMakeBorder(
+            img, 20, 20, 20, 20,
+            cv2.BORDER_CONSTANT,
+            value=[255, 255, 255]
+        )
+
+    if denoise:
+        img = cv2.fastNlMeansDenoisingColored(img, None, 5, 5, 7, 21)
+
+    if contrast:
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        cl = clahe.apply(l)
+        img = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+
+    if deskew:
+        img = deskew_image_cv(img)
+
+    if sharpen:
+        kernel = np.array([[0, -1, 0],
+                           [-1, 5, -1],
+                           [0, -1, 0]])
+        img = cv2.filter2D(img, -1, kernel)
+
+    cv2.imwrite(str(output_image), img)
+================================================================================================================
+
+2. Universal document loader
+The loader auto-detects PDF, image, TIFF multi-page, SVG inputs and converts them into normalized page images.
+================================================================================================================
+
+class UniversalDocumentLoader:
+    def __init__(self, out_dir: Path, dpi: int = 300):
+        self.out_dir = Path(out_dir)
+        self.dpi = dpi
+
+    def load(self, input_path: str | Path) -> tuple[list[LoadedPage], dict]:
+        input_path = Path(input_path)
+        ext = input_path.suffix.lower()
+
+        if ext not in SUPPORTED_INPUTS:
+            raise ValueError(f"Unsupported file type: {ext}. Supported: {sorted(SUPPORTED_INPUTS)}")
+
+        if ext == ".pdf":
+            return self.load_pdf(input_path)
+        if ext == ".svg":
+            return self.load_svg(input_path)
+        return self.load_image(input_path)
+
+    def load_pdf(self, pdf_path: Path) -> tuple[list[LoadedPage], dict]:
+        doc = fitz.open(str(pdf_path))
+        pages = []
+
+        original_dir = self.out_dir / "loader" / "original_pages"
+        normalized_dir = self.out_dir / "loader" / "normalized_pages"
+
+        zoom = self.dpi / 72.0
+        matrix = fitz.Matrix(zoom, zoom)
+
+        for page_number, page in enumerate(tqdm(doc, desc="Loading PDF pages"), start=1):
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+
+            original = original_dir / f"page_{page_number:04d}.png"
+            normalized = normalized_dir / f"page_{page_number:04d}_normalized.png"
+            ensure_dir(original.parent)
+
+            pix.save(str(original))
+            normalize_layout(original, normalized)
+
+            with Image.open(normalized) as im:
+                width, height = im.size
+
+            pages.append(LoadedPage(
+                page_number=page_number,
+                source_type="pdf_page",
+                original_image=str(original.relative_to(self.out_dir)),
+                normalized_image=str(normalized.relative_to(self.out_dir)),
+                width=width,
+                height=height,
+            ))
+
+        return pages, {
+            "input_type": "pdf",
+            "page_count": doc.page_count,
+            "pdf_metadata": dict(doc.metadata or {}),
+        }
+
+    def load_image(self, image_path: Path) -> tuple[list[LoadedPage], dict]:
+        img = Image.open(image_path)
+
+        # TIFF can contain multiple pages/frames
+        frames = list(ImageSequence.Iterator(img)) if image_path.suffix.lower() in [".tif", ".tiff"] else [img]
+        pages = []
+
+        original_dir = self.out_dir / "loader" / "original_pages"
+        normalized_dir = self.out_dir / "loader" / "normalized_pages"
+
+        for page_number, frame in enumerate(tqdm(frames, desc="Loading image frames"), start=1):
+            original = original_dir / f"page_{page_number:04d}.png"
+            normalized = normalized_dir / f"page_{page_number:04d}_normalized.png"
+            ensure_dir(original.parent)
+
+            frame.convert("RGB").save(original)
+            normalize_layout(original, normalized)
+
+            with Image.open(normalized) as im:
+                width, height = im.size
+
+            pages.append(LoadedPage(
+                page_number=page_number,
+                source_type="image",
+                original_image=str(original.relative_to(self.out_dir)),
+                normalized_image=str(normalized.relative_to(self.out_dir)),
+                width=width,
+                height=height,
+            ))
+
+        return pages, {
+            "input_type": "image",
+            "frame_count": len(frames),
+            "format": img.format,
+        }
+
+    def load_svg(self, svg_path: Path) -> tuple[list[LoadedPage], dict]:
+        svg_dir = self.out_dir / "svg"
+        ensure_dir(svg_dir)
+
+        svg_text = svg_path.read_text(encoding="utf-8", errors="replace")
+        write_text(svg_dir / "raw_svg.xml", svg_text)
+
+        svg_text_records = extract_svg_text(svg_path)
+        write_json(svg_dir / "svg_text_elements.json", svg_text_records)
+        write_text(svg_dir / "svg_text_content.txt", "\\n".join([x.get("text", "") for x in svg_text_records]))
+
+        original = self.out_dir / "loader" / "original_pages" / "page_0001.png"
+        normalized = self.out_dir / "loader" / "normalized_pages" / "page_0001_normalized.png"
+
+        rasterized = False
+        try:
+            import cairosvg
+            ensure_dir(original.parent)
+            cairosvg.svg2png(url=str(svg_path), write_to=str(original), dpi=self.dpi)
+            normalize_layout(original, normalized)
+            rasterized = True
+        except Exception as e:
+            write_text(self.out_dir / "logs" / "svg_rasterization_error.txt", str(e))
+
+        pages = []
+        if rasterized:
+            with Image.open(normalized) as im:
+                width, height = im.size
+
+            pages.append(LoadedPage(
+                page_number=1,
+                source_type="svg_rasterized",
+                original_image=str(original.relative_to(self.out_dir)),
+                normalized_image=str(normalized.relative_to(self.out_dir)),
+                width=width,
+                height=height,
+            ))
+
+        return pages, {
+            "input_type": "svg",
+            "svg_text_element_count": len(svg_text_records),
+            "svg_rasterized": rasterized,
+        }
+
+def extract_svg_text(svg_path: Path) -> list[dict]:
+    records = []
+    try:
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+        for elem in root.iter():
+            tag = elem.tag.split("}")[-1]
+            if tag in ["text", "tspan"]:
+                text = "".join(elem.itertext()).strip()
+                if text:
+                    records.append({
+                        "tag": tag,
+                        "text": text,
+                        "attributes": dict(elem.attrib),
+                    })
+    except Exception as e:
+        records.append({"error": str(e)})
+    return records
+
+=======================================================================================================================
+Text extraction and OCR
+This outputs both native PDF text and OCR text from normalized page images.
+================================================================================================================
+
+def extract_pdf_native_text(input_path: Path, out_dir: Path) -> tuple[str, list[TextRecord]]:
+    if input_path.suffix.lower() != ".pdf":
+        return "", []
+
+    doc = fitz.open(str(input_path))
+    all_text_parts = []
+    records = []
+
+    for page_number, page in enumerate(tqdm(doc, desc="Extracting native PDF text"), start=1):
+        text = clean_text(page.get_text("text"))
+        text_file = out_dir / "texts" / "native_pages" / f"page_{page_number:04d}.txt"
+        write_text(text_file, text)
+
+        all_text_parts.append(f"\\n\\n===== PAGE {page_number} =====\\n\\n{text}")
+
+        records.append(TextRecord(
+            page_number=page_number,
+            native_text_file=str(text_file.relative_to(out_dir)),
+            ocr_text_file=None,
+            native_word_count=len(text.split()),
+            ocr_word_count=0,
+        ))
+
+    full_text = clean_text("".join(all_text_parts))
+    write_text(out_dir / "texts" / "native_full_text.txt", full_text)
+
+    return full_text, records
+
+def ocr_page_image(image_path: Path, lang: str = "eng", psm: int = 6) -> tuple[str, list[dict]]:
+    if pytesseract is None or not command_exists("tesseract"):
+        return "", []
+
+    try:
+        image = Image.open(image_path)
+        config = f"--psm {psm}"
+        text = clean_text(pytesseract.image_to_string(image, lang=lang, config=config))
+
+        data = pytesseract.image_to_data(
+            image,
+            lang=lang,
+            config=config,
+            output_type=pytesseract.Output.DICT
+        )
+
+        words = []
+        for i, word in enumerate(data.get("text", [])):
+            word = str(word).strip()
+            if not word:
+                continue
+            words.append({
+                "text": word,
+                "conf": data["conf"][i],
+                "x": data["left"][i],
+                "y": data["top"][i],
+                "w": data["width"][i],
+                "h": data["height"][i],
+            })
+
+        return text, words
+
+    except Exception as e:
+        return f"[OCR_ERROR] {e}", []
+
+def run_ocr_on_pages(
+    pages: list[LoadedPage],
+    out_dir: Path,
+    ocr_lang: str = "eng",
+    psm: int = 6
+) -> list[TextRecord]:
+    records = []
+
+    if not has_tesseract():
+        print("OCR skipped: Tesseract is not installed or not in PATH.")
+        return records
+
+    for page in tqdm(pages, desc="Running OCR on normalized pages"):
+        image_path = out_dir / page.normalized_image
+        text, words = ocr_page_image(image_path, lang=ocr_lang, psm=psm)
+
+        text_file = out_dir / "texts" / "ocr_pages" / f"page_{page.page_number:04d}_ocr.txt"
+        json_file = out_dir / "texts" / "ocr_pages" / f"page_{page.page_number:04d}_ocr_words.json"
+
+        write_text(text_file, text)
+        write_json(json_file, words)
+
+        records.append(TextRecord(
+            page_number=page.page_number,
+            native_text_file=None,
+            ocr_text_file=str(text_file.relative_to(out_dir)),
+            native_word_count=0,
+            ocr_word_count=len(text.split()),
+        ))
+
+    # combined OCR full text
+    combined = []
+    for rec in records:
+        if rec.ocr_text_file:
+            p = out_dir / rec.ocr_text_file
+            combined.append(f"\\n\\n===== PAGE {rec.page_number} OCR =====\\n\\n{p.read_text(encoding='utf-8', errors='replace')}")
+    write_text(out_dir / "texts" / "ocr_full_text.txt", clean_text("".join(combined)))
+
+    return records
+
+==========================================================================================================================
+
+4. Image extraction
+This saves:
+
+rendered original pages
+normalized pages
+embedded PDF images at original quality
+====================================================================================================================
+
+def extract_pdf_embedded_images(input_path: Path, out_dir: Path) -> list[ImageRecord]:
+    if input_path.suffix.lower() != ".pdf":
+        return []
+
+    doc = fitz.open(str(input_path))
+    records = []
+
+    for page_number, page in enumerate(tqdm(doc, desc="Extracting embedded PDF images"), start=1):
+        images = page.get_images(full=True) or []
+
+        for image_number, img in enumerate(images, start=1):
+            xref = img[0]
+            try:
+                extracted = doc.extract_image(xref)
+                ext = extracted.get("ext", "png")
+                width = int(extracted.get("width", 0))
+                height = int(extracted.get("height", 0))
+
+                image_file = out_dir / "images" / "embedded_original" / f"page_{page_number:04d}_image_{image_number:04d}.{ext}"
+                ensure_dir(image_file.parent)
+                image_file.write_bytes(extracted["image"])
+
+                bbox = None
+                try:
+                    rects = page.get_image_rects(xref)
+                    if rects:
+                        r = rects[0]
+                        bbox = [float(r.x0), float(r.y0), float(r.x1), float(r.y1)]
+                except Exception:
+                    pass
+
+                records.append(ImageRecord(
+                    page_number=page_number,
+                    image_number=image_number,
+                    image_file=str(image_file.relative_to(out_dir)),
+                    width=width,
+                    height=height,
+                    extension=ext,
+                    source="pdf_embedded",
+                    bbox=bbox,
+                ))
+
+            except Exception as e:
+                write_text(out_dir / "logs" / "embedded_image_errors.log", f"Page {page_number}, image {image_number}: {e}\\n")
+
+    return records
+
+def register_page_images(pages: list[LoadedPage], out_dir: Path) -> list[ImageRecord]:
+    records = []
+    for page in pages:
+        for source, rel_path in [("rendered_page", page.original_image), ("normalized_page", page.normalized_image)]:
+            image_path = out_dir / rel_path
+            if not image_path.exists():
+                continue
+            with Image.open(image_path) as im:
+                width, height = im.size
+            records.append(ImageRecord(
+                page_number=page.page_number,
+                image_number=0,
+                image_file=rel_path,
+                width=width,
+                height=height,
+                extension=image_path.suffix.lower().replace(".", ""),
+                source=source,
+                bbox=None,
+            ))
+    return records
+================================================================================================================
+
+5. Table extraction
+For PDF reports, this extracts tables into CSV and one Excel workbook.
+
+====================================================================================================================
+
+def extract_pdf_tables(input_path: Path, out_dir: Path) -> list[TableRecord]:
+    records = []
+
+    if input_path.suffix.lower() != ".pdf":
+        return records
+
+    if pdfplumber is None:
+        print("Table extraction skipped: pdfplumber is not installed.")
+        return records
+
+    tables_dir = out_dir / "tables"
+    ensure_dir(tables_dir)
+
+    excel_file = tables_dir / "all_tables.xlsx"
+
+    with pdfplumber.open(str(input_path)) as pdf, pd.ExcelWriter(excel_file, engine="openpyxl") as writer:
+        for page_number, page in enumerate(tqdm(pdf.pages, desc="Extracting tables"), start=1):
+            try:
+                tables = page.extract_tables() or []
+            except Exception as e:
+                write_text(out_dir / "logs" / "table_errors.log", f"Page {page_number}: {e}\\n")
+                continue
+
+            for table_number, table in enumerate(tables, start=1):
+                if not table:
+                    continue
+
+                df = pd.DataFrame(table)
+                csv_file = tables_dir / f"page_{page_number:04d}_table_{table_number:04d}.csv"
+                df.to_csv(csv_file, index=False, header=False)
+
+                sheet = f"p{page_number:04d}_t{table_number:02d}"[:31]
+                df.to_excel(writer, index=False, header=False, sheet_name=sheet)
+
+                records.append(TableRecord(
+                    page_number=page_number,
+                    table_number=table_number,
+                    csv_file=str(csv_file.relative_to(out_dir)),
+                    rows=int(df.shape[0]),
+                    cols=int(df.shape[1]),
+                    source="pdfplumber",
+                ))
+
+    return records
+
+=================================================================================================================
+
+6. Chart / figure detection
+This detects and crops likely chart regions using OpenCV line/edge density.
+===================================================================================================================
+
+def detect_chart_candidates(pages: list[LoadedPage], out_dir: Path) -> list[ChartRecord]:
+    records = []
+
+    for page in tqdm(pages, desc="Detecting chart candidates"):
+        image_path = out_dir / page.normalized_image
+        img = cv2.imread(str(image_path))
+        if img is None:
+            continue
+
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Detect line-heavy/box-heavy regions, useful for charts, diagrams, tables, columns.
+        edges = cv2.Canny(gray, 50, 150)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        h, w = gray.shape[:2]
+        page_area = w * h
+        candidates = []
+
+        for cnt in contours:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            area = bw * bh
+
+            if area < page_area * 0.025:
+                continue
+            if bw < 120 or bh < 80:
+                continue
+
+            aspect = bw / max(bh, 1)
+            if aspect < 0.12 or aspect > 10:
+                continue
+
+            candidates.append((x, y, bw, bh, area))
+
+        # Largest candidates first
+        candidates = sorted(candidates, key=lambda z: z[4], reverse=True)[:10]
+
+        for chart_number, (x, y, bw, bh, area) in enumerate(candidates, start=1):
+            crop = img[y:y+bh, x:x+bw]
+            crop_file = out_dir / "charts" / "candidates" / f"page_{page.page_number:04d}_chart_{chart_number:04d}.png"
+            ensure_dir(crop_file.parent)
+            cv2.imwrite(str(crop_file), crop)
+
+            records.append(ChartRecord(
+                page_number=page.page_number,
+                chart_number=chart_number,
+                crop_file=str(crop_file.relative_to(out_dir)),
+                bbox=[int(x), int(y), int(x + bw), int(y + bh)],
+                reason="large_line_or_edge_dense_region",
+            ))
+
+    return records
+==========================================================================================================================\
+
+7. Save Excel and JSON outputs
+Selection deleted
+=================================================================================================================
+
+def make_summary_safe_df(records):
+    """
+    Convert records into a DataFrame that is safe for Excel export.
+    Nested objects such as dict/list/tuple/set and NumPy objects are serialized.
+    """
+    df = pd.DataFrame(records)
+
+    def safe_value(x):
+        if isinstance(x, (dict, list, tuple, set)):
+            return json.dumps(x, ensure_ascii=False)
+        if isinstance(x, np.ndarray):
+            return json.dumps(x.tolist(), ensure_ascii=False)
+        if isinstance(x, (np.integer,)):
+            return int(x)
+        if isinstance(x, (np.floating,)):
+            return float(x)
+        if isinstance(x, (np.bool_,)):
+            return bool(x)
+        return x
+
+    for col in df.columns:
+        df[col] = df[col].apply(safe_value)
+
+    return df
+
+
+def save_outputs(
+    out_dir: Path,
+    metadata: dict,
+    pages: list[LoadedPage],
+    text_records: list[TextRecord],
+    image_records: list[ImageRecord],
+    table_records: list[TableRecord],
+    chart_records: list[ChartRecord],
+) -> dict:
+    ensure_dir(out_dir / "metadata")
+    ensure_dir(out_dir / "summary")
+
+    # Save JSON metadata
+    write_json(out_dir / "metadata" / "metadata.json", metadata)
+    write_json(out_dir / "metadata" / "pages.json", [asdict(x) for x in pages])
+    write_json(out_dir / "metadata" / "texts.json", [asdict(x) for x in text_records])
+    write_json(out_dir / "metadata" / "images.json", [asdict(x) for x in image_records])
+    write_json(out_dir / "metadata" / "tables.json", [asdict(x) for x in table_records])
+    write_json(out_dir / "metadata" / "charts.json", [asdict(x) for x in chart_records])
+
+    # Excel summary
+    excel_path = out_dir / "summary" / "extraction_summary.xlsx"
+
+    with pd.ExcelWriter(excel_path, engine="openpyxl") as writer:
+        make_summary_safe_df([metadata]).to_excel(
+            writer, sheet_name="metadata", index=False
+        )
+
+        make_summary_safe_df([asdict(x) for x in pages]).to_excel(
+            writer, sheet_name="pages", index=False
+        )
+
+        make_summary_safe_df([asdict(x) for x in text_records]).to_excel(
+            writer, sheet_name="texts", index=False
+        )
+
+        make_summary_safe_df([asdict(x) for x in image_records]).to_excel(
+            writer, sheet_name="images", index=False
+        )
+
+        make_summary_safe_df([asdict(x) for x in table_records]).to_excel(
+            writer, sheet_name="tables", index=False
+        )
+
+        make_summary_safe_df([asdict(x) for x in chart_records]).to_excel(
+            writer, sheet_name="charts", index=False
+        )
+
+    readme = f"""
+
+
+# Chart Extractor Results
+
+## Input
+`{metadata.get("input_file")}`
+
+## Outputs saved
+
+- Texts: `texts/`
+- Images: `images/`
+- Rendered pages: `loader/original_pages/`
+- Normalized pages: `loader/normalized_pages/`
+- Tables: `tables/`
+- Charts: `charts/candidates/`
+- Metadata JSON: `metadata/`
+- Excel summary: `summary/extraction_summary.xlsx`
+
+## Counts
+
+- Pages: {len(pages)}
+- Text records: {len(text_records)}
+- Image records: {len(image_records)}
+- Tables: {len(table_records)}
+- Chart candidates: {len(chart_records)}
+
+## Note
+
+For complex biostratigraphic charts, this notebook extracts chart images and OCR text.
+Scientific interpretation of fossil zones, depth columns, bioevents, lithology units, and occurrence-matrix reconstruction requires the STRATA-X matrix parser as a second-stage domain parser.
+"""
+    write_text(out_dir / "README_RESULTS.md", readme)
+
+    return {
+        "excel_summary": str(excel_path),
+        "readme": str(out_dir / "README_RESULTS.md"),
+    }
+============================================================================================================================
+
+8. Master extraction function
+Function to run.
+
+=======================================================================================================
+def run_full_extraction(
+    input_file: str,
+    output_folder: str = "extracted_output",
+    dpi: int = 300,
+    run_ocr: bool = True,
+    ocr_lang: str = "eng",
+    tesseract_psm: int = 6,
+) -> dict:
+    input_path = Path(input_file).resolve()
+    out_dir = Path(output_folder).resolve()
+
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    ensure_dir(out_dir)
+
+    metadata = {
+        "input_file": str(input_path),
+        "file_name": input_path.name,
+        "file_type": input_path.suffix.lower(),
+        "file_size_bytes": input_path.stat().st_size,
+        "extracted_at_utc": datetime.utcnow().isoformat() + "Z",
+        "pipeline": "Geological Extractor - charts, tables, images, texts",
+    }
+
+    # 1. Load and normalize pages
+    loader = UniversalDocumentLoader(out_dir=out_dir, dpi=dpi)
+    pages, loader_metadata = loader.load(input_path)
+    metadata.update(loader_metadata)
+
+    # 2. Native PDF text extraction with PyMuPDF
+    native_full_text, native_text_records = extract_pdf_native_text(input_path, out_dir)
+
+    # 3. OCR extraction
+    ocr_text_records = []
+    if run_ocr:
+        ocr_text_records = run_ocr_on_pages(
+            pages=pages,
+            out_dir=out_dir,
+            ocr_lang=ocr_lang,
+            psm=tesseract_psm
+        )
+
+    text_records = native_text_records + ocr_text_records
+
+    # 4. Image extraction
+    page_image_records = register_page_images(pages, out_dir)
+    embedded_image_records = extract_pdf_embedded_images(input_path, out_dir)
+    image_records = page_image_records + embedded_image_records
+
+    # 5. Ordinary PDF table extraction
+    table_records = extract_pdf_tables(input_path, out_dir)
+
+    # 6. Chart detection
+    chart_records = detect_chart_candidates(pages, out_dir)
+
+    # 7. Save everything as JSON and Excel
+    saved = save_outputs(
+        out_dir=out_dir,
+        metadata=metadata,
+        pages=pages,
+        text_records=text_records,
+        image_records=image_records,
+        table_records=table_records,
+        chart_records=chart_records,
+    )
+
+    results = {
+        "output_folder": str(out_dir),
+        "pages": len(pages),
+        "texts": len(text_records),
+        "images": len(image_records),
+        "tables": len(table_records),
+        "charts": len(chart_records),
+        **saved,
+    }
+
+    print("\\nDONE. Extraction completed.")
+    for k, v in results.items():
+        print(f"{k}: {v}")
+
+    return results
+
+=============================================================================================================================
+9. Run the extractor
+INPUT_FILE PDF/image/SVG file/etc.
+======================================================================================================================
+
+INPUT_FILE = "BIOSTRATIGRAPHIC DATA2.pdf"
+OUTPUT_FOLDER = "extracted_output"
+DPI = 300
+
+results = run_full_extraction(
+    input_file=INPUT_FILE,
+    output_folder=OUTPUT_FOLDER,
+    dpi=DPI,
+    run_ocr=True,
+    ocr_lang="eng",
+    tesseract_psm=6,
+)
+
+results
